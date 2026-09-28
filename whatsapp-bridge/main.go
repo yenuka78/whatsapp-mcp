@@ -1594,6 +1594,38 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 	})
 
+	// Handler for fetching group info (name, description, participants)
+	http.HandleFunc("/api/group-info", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		jidStr := r.URL.Query().Get("jid")
+		if jidStr == "" {
+			http.Error(w, "jid query parameter required", http.StatusBadRequest)
+			return
+		}
+		jid, err := types.ParseJID(jidStr)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid JID: %v", err), http.StatusBadRequest)
+			return
+		}
+		groupInfo, err := client.GetGroupInfo(context.Background(), jid)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to get group info: %v", err), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"jid":         groupInfo.JID.String(),
+			"name":        groupInfo.Name,
+			"topic":       groupInfo.Topic,
+			"description": groupInfo.TopicID,
+			"participant_count": len(groupInfo.Participants),
+			"created":     groupInfo.GroupCreated,
+		})
+	})
+
 	// Start the server with proper timeouts. Bind to loopback so the bridge is
 	// not reachable from the LAN; MCP clients talk to it over localhost.
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
