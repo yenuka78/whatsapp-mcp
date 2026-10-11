@@ -1,5 +1,8 @@
+import os
 import signal
 import sys
+import threading
+import time
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -367,14 +370,28 @@ def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
 
 
 def shutdown_handler(signum, frame):
-    """Handle shutdown signals gracefully to prevent zombie processes."""
-    sys.exit(0)
+    """Exit immediately. sys.exit() only raises SystemExit, which the MCP event
+    loop can swallow, leaving the process alive after Claude has gone."""
+    os._exit(0)
+
+
+def exit_when_orphaned():
+    """Claude launches this server through `uv run`; when the session ends, uv can
+    die without passing anything on, and this process is reparented and lives on
+    (71 of them, 3.4 GB, found on 2026-10-11). Exit as soon as the parent changes."""
+    parent = os.getppid()
+    while True:
+        time.sleep(5)
+        if os.getppid() != parent:
+            os._exit(0)
 
 
 if __name__ == "__main__":
     # Register signal handlers for clean shutdown
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGHUP, shutdown_handler)
+    threading.Thread(target=exit_when_orphaned, daemon=True).start()
 
     # Initialize and run the server
     mcp.run(transport="stdio")
