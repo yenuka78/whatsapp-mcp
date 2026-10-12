@@ -16,6 +16,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
+	"go.mau.fi/whatsmeow/proto/waMmsRetry"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -1262,13 +1264,15 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
 	var fileLength uint64
 	var timestamp time.Time
+	var sender string
+	var isFromMe bool
 	var err error
 
 	// Get media info AND timestamp from the database
 	err = messageStore.db.QueryRow(
-		"SELECT media_type, url, media_key, file_sha256, file_enc_sha256, file_length, timestamp FROM messages WHERE id = ? AND chat_jid = ?",
+		"SELECT media_type, url, media_key, file_sha256, file_enc_sha256, file_length, timestamp, sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?",
 		messageID, chatJID,
-	).Scan(&mediaType, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength, &timestamp)
+	).Scan(&mediaType, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength, &timestamp, &sender, &isFromMe)
 
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to find message: %v", err)
@@ -1358,7 +1362,19 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	// Download the media using whatsmeow client
 	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		// WhatsApp's CDN drops media after a couple of weeks. The sender's phone
+		// may still have it: ask it to re-upload, as WhatsApp does when you tap
+		// an expired photo, then download from the new path.
+		fmt.Printf("Download failed (%v), asking the sender's phone to re-upload...\n", err)
+		newPath, retryErr := requestMediaRetry(client, messageID, chatJID, sender, isFromMe, timestamp, mediaKey)
+		if retryErr != nil {
+			return false, "", "", "", fmt.Errorf("failed to download media: %v; re-upload: %v", err, retryErr)
+		}
+		downloader.DirectPath = newPath
+		downloader.URL = ""
+		if mediaData, err = client.Download(context.Background(), downloader); err != nil {
+			return false, "", "", "", fmt.Errorf("failed to download re-uploaded media: %v", err)
+		}
 	}
 
 	// Save the downloaded media to file
@@ -1368,6 +1384,78 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
 	return true, mediaType, filename, absPath, nil
+}
+
+// Media retry answers arrive as events, matched to the waiting download by message ID.
+var (
+	mediaRetryMu      sync.Mutex
+	mediaRetryWaiters = map[string]chan *events.MediaRetry{}
+)
+
+func handleMediaRetry(evt *events.MediaRetry) {
+	mediaRetryMu.Lock()
+	ch := mediaRetryWaiters[string(evt.MessageID)]
+	mediaRetryMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- evt:
+		default:
+		}
+	}
+}
+
+// requestMediaRetry asks the phone that sent a message to upload its media
+// again and returns the new direct path. Only works while that phone still
+// has the file.
+func requestMediaRetry(client *whatsmeow.Client, messageID, chatJID, sender string, isFromMe bool, ts time.Time, mediaKey []byte) (string, error) {
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return "", err
+	}
+	info := &types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: chat, IsFromMe: isFromMe, IsGroup: chat.Server == types.GroupServer},
+		ID:            types.MessageID(messageID),
+		Timestamp:     ts,
+	}
+	if info.IsGroup && !isFromMe {
+		// The DB keeps the sender as a phone number; lid-addressed groups
+		// name participants by LID, so prefer that when it is known.
+		pn := types.NewJID(sender, types.DefaultUserServer)
+		if strings.Contains(sender, "@") {
+			pn, _ = types.ParseJID(sender)
+		}
+		info.Sender = pn
+		if lid, err := client.Store.LIDs.GetLIDForPN(context.Background(), pn); err == nil && !lid.IsEmpty() {
+			info.Sender = lid
+		}
+	}
+
+	ch := make(chan *events.MediaRetry, 1)
+	mediaRetryMu.Lock()
+	mediaRetryWaiters[messageID] = ch
+	mediaRetryMu.Unlock()
+	defer func() {
+		mediaRetryMu.Lock()
+		delete(mediaRetryWaiters, messageID)
+		mediaRetryMu.Unlock()
+	}()
+
+	if err := client.SendMediaRetryReceipt(context.Background(), info, mediaKey); err != nil {
+		return "", fmt.Errorf("send retry receipt: %v", err)
+	}
+	select {
+	case evt := <-ch:
+		notif, err := whatsmeow.DecryptMediaRetryNotification(evt, mediaKey)
+		if err != nil {
+			return "", err
+		}
+		if notif.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS || notif.GetDirectPath() == "" {
+			return "", fmt.Errorf("phone answered %s", notif.GetResult())
+		}
+		return notif.GetDirectPath(), nil
+	case <-time.After(30 * time.Second):
+		return "", fmt.Errorf("no answer from the sender's phone within 30s")
+	}
 }
 
 // Extract direct path from a WhatsApp media URL
@@ -1743,6 +1831,9 @@ func main() {
 		case *events.Message:
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
+
+		case *events.MediaRetry:
+			handleMediaRetry(v)
 
 		case *events.HistorySync:
 			// Process history sync events
